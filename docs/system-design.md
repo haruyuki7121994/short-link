@@ -311,54 +311,94 @@ graph TD;
 
 This section is the proposed final design and resolves the conflicting alternatives above. Scope: one region across multiple availability zones, immutable URL mappings with optional expiration and custom aliases, and eventually consistent analytics. Target peak traffic is approximately 120 creates/s and 116,000 redirects/s; these are sizing inputs, not measured capacity.
 
+## 1. Create URL flow
+
+`POST /shorten` validates the request and atomically stores a unique mapping. This flow uses write-around: Redis is populated later by reads.
+
 ```mermaid
-flowchart TB
-    Client["Client / browser"]
-    Dashboard["Analytics dashboard"]
-    Edge["Highly available load balancer<br/>TLS, routing, rate limits"]
-
-    subgraph App["Stateless application tier - multiple availability zones"]
-        Create["Create service<br/>Validate URL, alias and expiration<br/>Random Base62 code; bounded collision retries"]
-        Redirect["Redirect service<br/>Cache-aside lookup<br/>Check expires_at on every result"]
-        Analytics["Analytics API<br/>Read pre-aggregated results"]
-        Buffer["Bounded local event buffer<br/>Background publisher; loss possible"]
-    end
-
-    subgraph Serving["URL serving data - separate from analytics"]
-        Cache[("Redis cluster<br/>Replicas and failover<br/>Mapping cache; bounded TTL with jitter")]
-        DB[("DynamoDB url_mappings<br/>short_url partition key<br/>Managed partitioning and multi-AZ replication")]
-    end
-
-    subgraph Pipeline["Asynchronous analytics pipeline"]
-        Kafka[("Kafka<br/>Partitioned and replicated click topic")]
-        Workers["Consumer group<br/>Deduplicate event_id<br/>Batch writes; retry failures"]
-        Warehouse[("Analytics warehouse<br/>Daily event partitions; 30-day raw retention<br/>Aggregates by short URL and day")]
-        DLQ[("Dead-letter topic<br/>Failed records for inspection and replay")]
-    end
-
-    Client -->|"POST /shorten or GET /code"| Edge
-    Dashboard -->|"GET /analytics/code"| Edge
-    Edge -->|"POST /shorten"| Create
-    Edge -->|"GET /code"| Redirect
-    Edge -->|"GET /analytics/code"| Analytics
-
-    Create -->|"Conditional insert: key must not exist"| DB
-    Create -->|"After durable success: 201; alias conflict: 409"| Edge
-    Redirect <-->|"1. Read cache; 3. Best-effort fill on valid DB hit"| Cache
-    Redirect <-->|"2. Miss: strongly consistent GetItem"| DB
-    Redirect -->|"302 Location; absent or expired: 404"| Edge
-    Edge -->|"HTTP response"| Client
-    Redirect -.->|"Valid redirect: enqueue without waiting for Kafka"| Buffer
-    Buffer -.->|"Background publish with retries"| Kafka
-    Kafka --> Workers
-    Workers -->|"Idempotent event writes and aggregation"| Warehouse
-    Workers -->|"After bounded processing retries"| DLQ
-    Analytics <-->|"Query aggregates"| Warehouse
-    Analytics -->|"Analytics response"| Edge
-    Edge -->|"Analytics response"| Dashboard
+flowchart TD
+    Client["Client"] -->|"POST /shorten"| Edge["Load balancer<br/>TLS, routing, rate limits"]
+    Edge --> Create["Create service<br/>Validate HTTP(S) URL, alias and expiration"]
+    Create --> Valid{"Valid request?"}
+    Valid -->|"No"| Bad["400 Bad Request"]
+    Valid -->|"Yes"| Alias{"Custom alias supplied?"}
+    Alias -->|"Yes"| Custom["Use validated custom alias"]
+    Alias -->|"No"| Generate["Generate random 7-character Base62 code"]
+    Custom --> DB[("DynamoDB url_mappings<br/>Conditional insert: short_url must not exist")]
+    Generate --> DB
+    DB --> Result{"Write result?"}
+    Result -->|"Durable success"| Created["201 Created<br/>Return short URL"]
+    Result -->|"Key conflict"| Conflict{"Custom alias?"}
+    Conflict -->|"Yes"| Taken["409 Conflict"]
+    Conflict -->|"No"| Budget{"Collision retry budget left?"}
+    Budget -->|"Yes"| Generate
+    Budget -->|"No"| Unavailable["503 Service Unavailable"]
+    Result -->|"DB unavailable / deadline exceeded"| Unavailable
 ```
 
-Solid arrows show request/response or data processing dependencies. Dotted arrows show analytics publication outside the redirect response path. Response arrows through the load balancer represent logical HTTP responses, not additional requests.
+Terminal HTTP responses return to the client through the load balancer. Generated-code retries are bounded; custom-alias conflicts are returned immediately.
+
+## 2. Read URL flow
+
+`GET /{code}` uses cache-aside reads, validates expiration on both cache and database results, and returns a redirect independently of event processing.
+
+```mermaid
+flowchart TD
+    Client["Client / browser"] -->|"GET /code"| Edge["Load balancer<br/>TLS, routing, rate limits"]
+    Edge --> Redirect["Redirect service"]
+    Redirect --> Cache[("Redis cluster<br/>Read mapping by short_url")]
+    Cache --> Lookup{"Cache result?"}
+    Lookup -->|"Hit"| Expiry{"Mapping expired?"}
+    Lookup -->|"Miss or Redis unavailable"| Guard["Coalesce misses; bounded waits<br/>Limit DB fallback concurrency"]
+    Guard --> Allowed{"Lookup capacity and deadline available?"}
+    Allowed -->|"No"| Unavailable["503 Service Unavailable"]
+    Allowed -->|"Yes"| DB[("DynamoDB url_mappings<br/>Strongly consistent GetItem")]
+    DB --> Result{"DB result?"}
+    Result -->|"Missing"| Missing["404 Not Found"]
+    Result -->|"Failure / deadline exceeded"| Unavailable
+    Result -->|"Found"| DBExpiry{"Mapping expired?"}
+    DBExpiry -->|"Yes"| Missing
+    DBExpiry -->|"No"| Fill["Best-effort Redis fill<br/>TTL = min(jittered lifetime, remaining URL lifetime)<br/>Cache failure does not block redirect"]
+    Fill --> Ready["Valid mapping"]
+    Expiry -->|"Yes"| Missing
+    Expiry -->|"No"| Ready
+    Ready --> Response["302 Found<br/>Location: long_url<br/>Cache-Control: no-store"]
+    Ready -.->|"Non-blocking event enqueue"| Buffer["Bounded local event buffer<br/>Continue in flow 3"]
+```
+
+Terminal HTTP responses return through the load balancer. Only an authoritative absent or expired result produces 404. Dotted arrows indicate asynchronous work: the redirect does not wait for Kafka or analytics storage.
+
+## 3. Handle events flow
+
+Valid redirects feed a background pipeline. Analytics remains eventually consistent; local-buffer overflow or process failure can lose events.
+
+```mermaid
+flowchart TD
+    Redirect["Valid redirect from flow 2"] -.-> Buffer["Bounded local event buffer<br/>event_id, short_url, clicked_at<br/>Optional referrer and user_agent"]
+    Buffer -.-> Publisher["Background publisher<br/>Bounded retries with backoff"]
+    Buffer -.->|"Overflow"| Drops["Count dropped events<br/>Alert on loss; redirects continue"]
+    Publisher -.->|"Retry budget exhausted"| Drops
+    Publisher -->|"Publish with acknowledgments"| Kafka[("Kafka click topic<br/>Partitioned and replicated<br/>Retention covers recovery window")]
+    Kafka --> Workers["Consumer group<br/>Validate and batch events"]
+    Workers --> Sink["Idempotent warehouse write<br/>Deduplicate by event_id before aggregation"]
+    Sink --> Result{"Write result?"}
+    Result -->|"Durable success"| Commit["Commit consumed offsets"]
+    Result -->|"Transient failure"| Budget{"Retry budget left?"}
+    Budget -->|"Yes: backoff"| Sink
+    Budget -->|"No"| DLQ[("Dead-letter topic<br/>Failed records for inspection and replay")]
+    Workers -->|"Invalid event"| DLQ
+    DLQ -->|"After durable dead-letter write"| Commit
+    DLQ -.->|"Controlled replay after correction"| Workers
+    Sink --> Warehouse[("Analytics warehouse<br/>Raw events partitioned by day; 30-day retention<br/>Aggregates by short URL and day")]
+    Dashboard["Analytics dashboard"] -->|"GET /analytics/code"| Edge["Load balancer"]
+    Edge --> Analytics["Analytics API"]
+    Analytics <-->|"Read aggregates"| Warehouse
+    Analytics -->|"Response through load balancer"| Dashboard
+```
+
+Do not commit offsets for a failed batch until it is durably stored or dead-lettered. Reprocessing must be safe after a crash between sink writes and offset commits. Dotted arrows show asynchronous publication or operational replay; they do not imply guaranteed delivery from the local buffer. Process crashes can lose buffered events before drop metrics are recorded.
+
+All three flows share the deployment described above: stateless services across availability zones, Redis replicas and failover, DynamoDB managed partitioning and replication, and Kafka replicas across availability zones.
 
 ## Decisions and request flows
 
