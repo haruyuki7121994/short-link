@@ -308,3 +308,89 @@ graph TD;
   - We can use a consistent hashing algorithm to minimize the number of shards that need to be moved when rebalancing.
 ## Load Balancer + Retry Mechanism
 # Final architecture diagram
+
+This section is the proposed final design and resolves the conflicting alternatives above. Scope: one region across multiple availability zones, immutable URL mappings with optional expiration and custom aliases, and eventually consistent analytics. Target peak traffic is approximately 120 creates/s and 116,000 redirects/s; these are sizing inputs, not measured capacity.
+
+```mermaid
+flowchart TB
+    Client["Client / browser"]
+    Dashboard["Analytics dashboard"]
+    Edge["Highly available load balancer<br/>TLS, routing, rate limits"]
+
+    subgraph App["Stateless application tier - multiple availability zones"]
+        Create["Create service<br/>Validate URL, alias and expiration<br/>Random Base62 code; bounded collision retries"]
+        Redirect["Redirect service<br/>Cache-aside lookup<br/>Check expires_at on every result"]
+        Analytics["Analytics API<br/>Read pre-aggregated results"]
+        Buffer["Bounded local event buffer<br/>Background publisher; loss possible"]
+    end
+
+    subgraph Serving["URL serving data - separate from analytics"]
+        Cache[("Redis cluster<br/>Replicas and failover<br/>Mapping cache; bounded TTL with jitter")]
+        DB[("DynamoDB url_mappings<br/>short_url partition key<br/>Managed partitioning and multi-AZ replication")]
+    end
+
+    subgraph Pipeline["Asynchronous analytics pipeline"]
+        Kafka[("Kafka<br/>Partitioned and replicated click topic")]
+        Workers["Consumer group<br/>Deduplicate event_id<br/>Batch writes; retry failures"]
+        Warehouse[("Analytics warehouse<br/>Daily event partitions; 30-day raw retention<br/>Aggregates by short URL and day")]
+        DLQ[("Dead-letter topic<br/>Failed records for inspection and replay")]
+    end
+
+    Client -->|"POST /shorten or GET /code"| Edge
+    Dashboard -->|"GET /analytics/code"| Edge
+    Edge -->|"POST /shorten"| Create
+    Edge -->|"GET /code"| Redirect
+    Edge -->|"GET /analytics/code"| Analytics
+
+    Create -->|"Conditional insert: key must not exist"| DB
+    Create -->|"After durable success: 201; alias conflict: 409"| Edge
+    Redirect <-->|"1. Read cache; 3. Best-effort fill on valid DB hit"| Cache
+    Redirect <-->|"2. Miss: strongly consistent GetItem"| DB
+    Redirect -->|"302 Location; absent or expired: 404"| Edge
+    Edge -->|"HTTP response"| Client
+    Redirect -.->|"Valid redirect: enqueue without waiting for Kafka"| Buffer
+    Buffer -.->|"Background publish with retries"| Kafka
+    Kafka --> Workers
+    Workers -->|"Idempotent event writes and aggregation"| Warehouse
+    Workers -->|"After bounded processing retries"| DLQ
+    Analytics <-->|"Query aggregates"| Warehouse
+    Analytics -->|"Analytics response"| Edge
+    Edge -->|"Analytics response"| Dashboard
+```
+
+Solid arrows show request/response or data processing dependencies. Dotted arrows show analytics publication outside the redirect response path. Response arrows through the load balancer represent logical HTTP responses, not additional requests.
+
+## Decisions and request flows
+
+1. **Create:** validate an absolute HTTP(S) destination, future expiration, and alias syntax. Reserve API paths such as `shorten` and `analytics`. Use a random 7-character Base62 code unless a custom alias is supplied. Use a conditional insert on `short_url`; a separate existence check cannot prevent concurrent collisions. Retry generated-code conflicts with a bounded retry budget; return 409 for a custom-alias conflict. Return success only after the database write succeeds. A repeated POST may create another code; request idempotency is a separate future feature.
+2. **Cache policy:** choose cache-aside with write-around. Creation writes only to the database; the first redirect populates Redis. Cache only valid mappings in this baseline, avoiding stale negative entries when an alias is created. Set TTL to the smaller of a jittered cache lifetime and remaining URL lifetime, and always validate `expires_at`, including cache hits. Redis is an optimization, not the source of truth.
+3. **Redirect:** look in Redis, then perform a strongly consistent base-table read on a miss so a newly created code is immediately readable. Return 302 with `Location` for a valid mapping; return 404 for absent or expired mappings, matching section 3. Do not rely on physical database TTL deletion for expiration. Use `Cache-Control: no-store` on redirects if each request must reach the service for expiration checks and analytics.
+4. **Overload and failures:** coalesce concurrent misses for the same code, with bounded waits. A lock timeout is not evidence that a URL is absent. Use a controlled DB fallback or return 503 when the lookup cannot complete; never convert dependency failures into 404. Bound database fallback concurrency during Redis outages, apply timeouts and circuit breakers, and use bounded retries with backoff and jitter. Database failures prevent successful creates; cached, unexpired mappings can still serve redirects. Scale and load-test for hot keys as well as total QPS.
+5. **Analytics:** enqueue an event containing `event_id`, `short_url`, `clicked_at`, and optional referrer/user-agent fields without waiting for Kafka. The local buffer can lose events on process failure or overflow; record drops and accept approximate counts in this baseline. Kafka acknowledgments and replication protect accepted events; consumers must handle redelivery with idempotent sink writes and deduplication before aggregation. Configure topic retention to cover the recovery window, partition events across brokers to avoid a viral URL dominating one partition, and batch warehouse writes. Retain raw events for 30 days; decide aggregate retention separately. Exact or billing-grade counts require a stronger durable event-capture design.
+6. **Availability and operations:** distribute application instances, Redis replicas, and Kafka replicas across availability zones. Let DynamoDB manage its replication and partitioning. Enable backups and test restores. Monitor redirect latency/error rate, cache hit rate, throttling, DB fallback load, event drops, consumer lag, and dead-letter records. Multi-region failover is outside this baseline.
+
+## Review corrections to earlier sections
+
+| Earlier statement | Correction used in the final design |
+| --- | --- |
+| A few thousand creates/day; later 1M/day | Use the explicit sizing example: 1M creates and 1B clicks/day. |
+| Write/read ratio is 1:100 | The stated volumes imply **1:1000**. |
+| Seven Base62 characters provide 3.5 billion codes | `62^7 = 3,521,614,606,208`, approximately **3.52 trillion**. Random codes still need atomic collision handling. |
+| Check for existence, then insert | Use a conditional insert so concurrent creates cannot overwrite each other. |
+| Snowflake fits into the seven-character example | A full 63-bit value can require **11 Base62 characters**; uniqueness also depends on worker-ID allocation and clock handling. Custom aliases still require conflict protection. |
+| Creation fills Redis, but policy says write-around | Choose write-around; only valid redirect misses fill Redis. |
+| Expired links return 410 in some flows, 404 in the API | Choose **404** for both absent and expired links. |
+| Lock wait failure returns 404 | Retry within a deadline or return 503; return 404 only after an authoritative absent/expired result. |
+| Short cache TTL solves replication lag | It does not. Use a strongly consistent base-table read on cache misses. |
+| Bloom-filter absence always returns 404 | Omit this optimization until filter completeness and synchronization with successful creates are guaranteed. |
+| Kafka publication precedes the redirect | Decouple it with bounded asynchronous buffering and explicitly accept possible event loss. |
+| Every click goes into a separate operational event database | Use the Kafka-to-warehouse path described later in section 6; avoid an unnecessary extra raw-event database. |
+
+At a 99% cache hit rate, peak mapping DB reads are approximately `116,000 × 0.01 = 1,160/s`; at 95%, they are `5,800/s`. A full cache outage could expose the DB to 116,000 reads/s without admission control. Validate the latency target with realistic cache-hit rates, item sizes, and failure tests.
+
+## References
+
+- [DynamoDB conditional writes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html): atomic insert-if-absent for generated codes and aliases.
+- [DynamoDB item reads](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithItems.html): strongly consistent reads on the base table.
+- [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/): cache population and stampede handling.
+- [Apache Kafka design](https://kafka.apache.org/design/): delivery semantics and consumer processing considerations.
