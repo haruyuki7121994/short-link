@@ -313,7 +313,7 @@ This section is the proposed final design and resolves the conflicting alternati
 
 ## 1. Create URL flow
 
-`POST /shorten` validates the request and atomically stores a unique mapping. This flow uses write-around: Redis is populated later by reads.
+`POST /shorten` uses **Snowflake ID + Base62** for generated codes. A generator runs inside each create-service instance, so normal ID generation is local. Custom aliases bypass the generator. The mapping still uses an atomic conditional insert, and creation does not populate Redis.
 
 ```mermaid
 flowchart TD
@@ -323,20 +323,93 @@ flowchart TD
     Valid -->|"No"| Bad["400 Bad Request"]
     Valid -->|"Yes"| Alias{"Custom alias supplied?"}
     Alias -->|"Yes"| Custom["Use validated custom alias"]
-    Alias -->|"No"| Generate["Generate random 7-character Base62 code"]
+    Alias -->|"No"| Begin
+
+    subgraph Snowflake["Local Snowflake generator - serialized nextId call"]
+        Begin["Acquire generator lock<br/>Check request deadline"] --> Ready{"Exclusive worker ownership<br/>and restart recovery complete?"}
+        Ready -->|"Yes"| Clock["Read current timestamp in milliseconds"]
+        Clock --> Range{"Timestamp within 41-bit epoch range?"}
+        Range -->|"Yes"| Backward{"now less than lastTimestamp?"}
+        Backward -->|"No"| Same{"now equals lastTimestamp?"}
+        Same -->|"No: newer millisecond"| Reset["sequence = 0"]
+        Same -->|"Yes"| Capacity{"sequence less than 4095?"}
+        Capacity -->|"Yes"| Increment["sequence = sequence + 1"]
+        Capacity -->|"No"| Wait["Wait for a newer millisecond<br/>Yield CPU; enforce deadline"]
+        Wait -->|"Time advanced"| Clock
+        Reset --> Recovery["Ensure timestamp is covered by<br/>durably reserved recovery watermark"]
+        Increment --> Recovery
+        Recovery -->|"Safe"| Build["id = elapsedMs shifted left 22<br/>OR workerId shifted left 12<br/>OR sequence"]
+        Build --> Save["lastTimestamp = now<br/>Release lock; return 63-bit ID"]
+        Ready -->|"No"| Fail["Release lock if held<br/>Fail generation; alert on unsafe state"]
+        Range -->|"No"| Fail
+        Backward -->|"Yes: clock rollback"| Fail
+        Wait -->|"Deadline exceeded"| Fail
+        Recovery -->|"Persistence unavailable"| Fail
+    end
+
+    Save --> Encode["Encode full ID using Base62<br/>Do not truncate; up to 11 characters"]
     Custom --> DB[("DynamoDB url_mappings<br/>Conditional insert: short_url must not exist")]
-    Generate --> DB
+    Encode --> DB
+    Fail --> Unavailable["503 Service Unavailable"]
     DB --> Result{"Write result?"}
     Result -->|"Durable success"| Created["201 Created<br/>Return short URL"]
-    Result -->|"Key conflict"| Conflict{"Custom alias?"}
+    Result -->|"Key conflict"| Conflict{"Custom alias request?"}
     Conflict -->|"Yes"| Taken["409 Conflict"]
-    Conflict -->|"No"| Budget{"Collision retry budget left?"}
-    Budget -->|"Yes"| Generate
-    Budget -->|"No"| Unavailable["503 Service Unavailable"]
-    Result -->|"DB unavailable / deadline exceeded"| Unavailable
+    Conflict -->|"No"| Budget{"Conflict retry budget left?"}
+    Budget -->|"Yes: obtain a fresh ID"| Begin
+    Budget -->|"No"| Unavailable
+    Result -->|"DB failure / deadline exceeded"| Unavailable
 ```
 
-Terminal HTTP responses return to the client through the load balancer. Generated-code retries are bounded; custom-alias conflicts are returned immediately.
+Terminal HTTP responses return through the load balancer. The generator lock protects only local ID state; it is released before the mapping database write. All waits and conflict retries share a bounded request deadline.
+
+### Snowflake layout and encoding
+
+This design uses the classic 41/10/12 allocation, with the 10 worker bits treated as one namespace across all availability zones. This is a design choice; implementations may split these bits into datacenter and worker fields.
+
+```text
+64-bit signed integer
++----------+-------------------------+----------------+----------------+
+| sign: 0  | elapsed milliseconds: 41 | worker ID: 10  | sequence: 12   |
++----------+-------------------------+----------------+----------------+
+
+elapsedMs = nowMs - epochMs
+id = (elapsedMs << 22) | (workerId << 12) | sequence
+shortCode = Base62(id)
+```
+
+| Field | Meaning and limit |
+| --- | --- |
+| Epoch | One fixed UTC epoch shared by every generator; never change it while reusing the same ID namespace. |
+| Elapsed milliseconds | Range `0 .. 2^41 - 1`, about 69.7 years. Reject timestamps outside this range. |
+| Worker ID | Range `0 .. 1023`: at most 1,024 concurrently distinct workers in this layout. |
+| Sequence | Range `0 .. 4095`: up to 4,096 IDs per millisecond per worker; this is a bit-layout limit, not a throughput benchmark. |
+| Base62 | Use a fixed alphabet, for example `0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz`. Preserve case and the entire integer. A maximum 63-bit ID requires 11 characters. |
+
+For example, `elapsedMs = 1000`, `workerId = 1`, and `sequence = 0` produce `id = 4194308096`, or `4Zqt8a` with the alphabet above. The next request in the same millisecond uses sequence 1. Another worker may use sequence 0 at the same timestamp because its worker bits differ.
+
+Use a 64-bit integer in Java or `BigInt` in JavaScript. Do not convert the ID to a JavaScript `Number`, which cannot represent every 63-bit integer exactly. Return the short-code string to clients.
+
+### Worker ownership and restart safety
+
+The following is the proposed deployment policy, beyond the bit-packing algorithm:
+
+- **Assign worker IDs explicitly:** maintain an allocation registry in deployment configuration. Each create-service instance owns a unique ID across all zones. Never derive it from a random number or a truncated IP address.
+- **Prevent overlapping owners:** before replacing an instance with the same worker ID, terminate or fence the old owner so it cannot generate more IDs. A pod name alone does not prove exclusive ownership. If termination cannot be confirmed during a partition, use another unused worker ID or keep the replacement unavailable. Do not blindly reuse IDs on a lease timeout.
+- **Persist a recovery watermark:** before issuing IDs, durably reserve an upper timestamp bound for that worker in a separate worker-state record. Generate only at timestamps covered by that bound. Reserve a small future window to amortize writes; extending the window must succeed before issuing IDs beyond it. This metadata is separate from `url_mappings` and is not updated for every ID.
+- **Recover after restart:** after fencing the previous owner, read the saved upper bound and wait until the clock is strictly beyond it before resetting the sequence. This prevents reusing an already issued timestamp/sequence pair after losing in-memory state. A larger reservation window reduces metadata writes but increases restart wait. If state is missing for a previously used worker, fail closed until it is recovered or a provably unused worker is assigned.
+- **Handle clock rollback:** reject generation while `now < lastTimestamp` and alert. Resume only when time catches up without resetting the sequence; on restart, use the durable recovery bound. Keep clock synchronization enabled, but do not assume it prevents all backward jumps.
+- **Handle sequence exhaustion:** after sequence 4095, wait until a strictly newer millisecond, then start at zero. Never wrap to zero in the same millisecond. Abort when the request deadline expires.
+
+With exclusive workers, safe restart state, and serialized generation, the tuple `(elapsedMs, workerId, sequence)` is unique. Base62 preserves that uniqueness because it is reversible and is not truncated. IDs are roughly time-ordered, not a strict global request ordering across workers.
+
+### Why a conditional insert is still required
+
+Generated codes and custom aliases share `short_url`, so an alias may already equal the Base62 representation of a future Snowflake ID. A generated-code conflict therefore obtains a fresh ID and retries within a budget; a requested-alias conflict returns 409. Repeated unexpected generated conflicts should alert operators to possible worker or clock errors. Never overwrite an existing mapping.
+
+If a write times out, its outcome may be unknown. A retry must not overwrite another mapping, and retrying the entire POST may create another short URL because this API does not yet implement request idempotency. Failed writes can leave gaps in the Snowflake sequence; gaps are harmless.
+
+Snowflake codes expose ordering and are guessable; they are not access tokens. This choice trades shorter random codes for distributed ID generation with explicit worker and clock management. The service's 120 creates/s target does not itself require Snowflake, but this flow documents the selected approach for scaling.
 
 ## 2. Read URL flow
 
@@ -398,16 +471,16 @@ flowchart TD
 
 Do not commit offsets for a failed batch until it is durably stored or dead-lettered. Reprocessing must be safe after a crash between sink writes and offset commits. Dotted arrows show asynchronous publication or operational replay; they do not imply guaranteed delivery from the local buffer. Process crashes can lose buffered events before drop metrics are recorded.
 
-All three flows share the deployment described above: stateless services across availability zones, Redis replicas and failover, DynamoDB managed partitioning and replication, and Kafka replicas across availability zones.
+All three flows share the deployment described above: services across availability zones (create instances additionally own worker IDs and local generator state), Redis replicas and failover, DynamoDB managed partitioning and replication, and Kafka replicas across availability zones.
 
 ## Decisions and request flows
 
-1. **Create:** validate an absolute HTTP(S) destination, future expiration, and alias syntax. Reserve API paths such as `shorten` and `analytics`. Use a random 7-character Base62 code unless a custom alias is supplied. Use a conditional insert on `short_url`; a separate existence check cannot prevent concurrent collisions. Retry generated-code conflicts with a bounded retry budget; return 409 for a custom-alias conflict. Return success only after the database write succeeds. A repeated POST may create another code; request idempotency is a separate future feature.
+1. **Create:** validate an absolute HTTP(S) destination, future expiration, and alias syntax. Reserve API paths such as `shorten` and `analytics`. Use a local Snowflake generator followed by full Base62 encoding unless a custom alias is supplied. Follow the worker ownership, clock, and restart rules in the create flow; generated codes can be up to 11 characters. Use a conditional insert on `short_url`; a separate existence check cannot prevent concurrent collisions. Retry generated-code conflicts with a bounded retry budget; return 409 for a custom-alias conflict. Return success only after the database write succeeds. A repeated POST may create another code; request idempotency is a separate future feature.
 2. **Cache policy:** choose cache-aside with write-around. Creation writes only to the database; the first redirect populates Redis. Cache only valid mappings in this baseline, avoiding stale negative entries when an alias is created. Set TTL to the smaller of a jittered cache lifetime and remaining URL lifetime, and always validate `expires_at`, including cache hits. Redis is an optimization, not the source of truth.
 3. **Redirect:** look in Redis, then perform a strongly consistent base-table read on a miss so a newly created code is immediately readable. Return 302 with `Location` for a valid mapping; return 404 for absent or expired mappings, matching section 3. Do not rely on physical database TTL deletion for expiration. Use `Cache-Control: no-store` on redirects if each request must reach the service for expiration checks and analytics.
 4. **Overload and failures:** coalesce concurrent misses for the same code, with bounded waits. A lock timeout is not evidence that a URL is absent. Use a controlled DB fallback or return 503 when the lookup cannot complete; never convert dependency failures into 404. Bound database fallback concurrency during Redis outages, apply timeouts and circuit breakers, and use bounded retries with backoff and jitter. Database failures prevent successful creates; cached, unexpired mappings can still serve redirects. Scale and load-test for hot keys as well as total QPS.
 5. **Analytics:** enqueue an event containing `event_id`, `short_url`, `clicked_at`, and optional referrer/user-agent fields without waiting for Kafka. The local buffer can lose events on process failure or overflow; record drops and accept approximate counts in this baseline. Kafka acknowledgments and replication protect accepted events; consumers must handle redelivery with idempotent sink writes and deduplication before aggregation. Configure topic retention to cover the recovery window, partition events across brokers to avoid a viral URL dominating one partition, and batch warehouse writes. Retain raw events for 30 days; decide aggregate retention separately. Exact or billing-grade counts require a stronger durable event-capture design.
-6. **Availability and operations:** distribute application instances, Redis replicas, and Kafka replicas across availability zones. Let DynamoDB manage its replication and partitioning. Enable backups and test restores. Monitor redirect latency/error rate, cache hit rate, throttling, DB fallback load, event drops, consumer lag, and dead-letter records. Multi-region failover is outside this baseline.
+6. **Availability and operations:** distribute application instances, Redis replicas, and Kafka replicas across availability zones; preserve exclusive Snowflake worker ownership during scaling and replacement. Let DynamoDB manage its replication and partitioning. Enable backups and test restores. Monitor redirect latency/error rate, cache hit rate, throttling, DB fallback load, event drops, consumer lag, and dead-letter records. Multi-region failover is outside this baseline.
 
 ## Review corrections to earlier sections
 
@@ -433,4 +506,5 @@ At a 99% cache hit rate, peak mapping DB reads are approximately `116,000 × 0.0
 - [DynamoDB conditional writes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html): atomic insert-if-absent for generated codes and aliases.
 - [DynamoDB item reads](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithItems.html): strongly consistent reads on the base table.
 - [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/): cache population and stampede handling.
+- [Original Snowflake ID worker](https://github.com/twitter-archive/snowflake/blob/snowflake-2010/src/main/scala/com/twitter/service/snowflake/IdWorker.scala): historical reference for timestamp/worker/sequence encoding; the recovery-watermark policy above is an additional design decision.
 - [Apache Kafka design](https://kafka.apache.org/design/): delivery semantics and consumer processing considerations.
