@@ -41,11 +41,12 @@ public class Base62EncodeShortUrlController {
 
     @GetMapping("/{shortUrl}")
     public ResponseEntity<?> redirect(@NotBlank @PathVariable(name = "shortUrl") String shortUrl) {
-        return Try.of(() -> base62EncodeServices.get("base62_encode_redirect").handle(shortUrl)).toEither().fold(
-                throwable -> ResponseEntity.internalServerError().body(throwable.getMessage()),
-                value -> value != null ?
-                        ResponseEntity.status(302).location(URI.create((String) value)).build() :
-                        ResponseEntity.internalServerError().body(null)
-        );
+        String longUrl = (String) base62EncodeServices
+                .get("base62_encode_redirect")
+                .handle(shortUrl);
+
+        return ResponseEntity.status(302)
+                .location(URI.create(longUrl))
+                .build();
     }
 }

@@ -41,7 +41,7 @@ public class Base62EncodeCreateShortUrlHandler implements Base62EncodeService {
                         .createdAt(LocalDateTime.now())
                         .updatedAt(LocalDateTime.now())
                         .build();
-                shortUrlRepository.save(newEntity);
+                shortUrlRepository.insert(newEntity);
                 return to(newEntity);
             } else if (isCustomAlias) {
                 return CreateShortUrlResponse.builder().existedAlias(true).build();
