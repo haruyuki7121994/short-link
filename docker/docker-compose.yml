@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: short_url_mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=123456
+      - MONGO_INITDB_DATABASE=short_url
+    volumes:
+      # Mount the initialization script so it runs when the container starts
+      - ./init-db.js:/docker-entrypoint-initdb.d/init-db.js:ro
+      # Optional: Persist data on your local machine
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:

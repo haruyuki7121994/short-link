@@ -208,7 +208,7 @@ graph TD;
             - If the ID is predictable, it may be possible to guess other short URLs -> **security concern**.
             - Distributed systems may have issues with auto-increment IDs
             - Example: if we have multiple database nodes, we need to ensure that the IDs are unique across all nodes, which can be challenging.
-            - To solve this, we go to Solution 4 (snowflake ID)
+            - To solve this, we go to Solution 4 (snowflake ID) or using **Centralize Counter from Redis**
     - Solution 4:
         - Snowflake ID + Base62 encoding
         - **Snowflake ID = timestamp + machine_id + sequence_number**
