@@ -39,6 +39,12 @@ public class Base62EncodeRedirectShortUrlHandler implements Base62EncodeService 
             return cached.longUrl();
         }
 
+//        databaseLookups là một Semaphore.
+//        Bạn có thể hình dung nó như một bãi xe có 64 chỗ:
+//        request muốn truy vấn DB phải lấy được một chỗ trước.
+//            Còn chỗ: lấy một chỗ rồi chạy tiếp.
+//            Hết chỗ: trả HTTP 503 ngay.
+//            tryAcquire() không đứng chờ chỗ trống, giúp tránh tích tụ request.
         if (!databaseLookups.tryAcquire()) {
             throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Lookup capacity exceeded");
         }
@@ -49,6 +55,7 @@ public class Base62EncodeRedirectShortUrlHandler implements Base62EncodeService 
         } finally {
             databaseLookups.release();
         }
+
         validateExpiration(entity.getExpiresAt());
         Duration ttl = Duration.ofMinutes(5).plusSeconds(TimeUtil.generateRandomNumber(1, 10));
         if (entity.getExpiresAt() != null) {

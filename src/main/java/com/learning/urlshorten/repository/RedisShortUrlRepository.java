@@ -23,8 +23,11 @@ public class RedisShortUrlRepository {
         try {
             String value = redisTemplate.opsForValue().get(key);
             if (value == null) return new CacheResult(null, null, false);
+
             var mapping = JSON.readValue(value, StoredMapping.class);
-            if (mapping == null || mapping.longUrl() == null) return new CacheResult(null, null, false);
+            if (mapping == null || mapping.longUrl() == null)
+                return new CacheResult(null, null, false);
+
             return new CacheResult(
                     mapping.longUrl(),
                     mapping.expiresAt() == null ? null : LocalDateTime.parse(mapping.expiresAt()),
