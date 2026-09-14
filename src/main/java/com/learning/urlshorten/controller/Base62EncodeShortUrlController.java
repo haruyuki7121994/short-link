@@ -16,6 +16,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.net.URI;
 import java.util.Map;
 
 @RestController
@@ -43,7 +44,7 @@ public class Base62EncodeShortUrlController {
         return Try.of(() -> base62EncodeServices.get("base62_encode_redirect").handle(shortUrl)).toEither().fold(
                 throwable -> ResponseEntity.internalServerError().body(throwable.getMessage()),
                 value -> value != null ?
-                        ResponseEntity.status(HttpStatus.FOUND.value()).body(value) :
+                        ResponseEntity.status(302).location(URI.create((String) value)).build() :
                         ResponseEntity.internalServerError().body(null)
         );
     }
