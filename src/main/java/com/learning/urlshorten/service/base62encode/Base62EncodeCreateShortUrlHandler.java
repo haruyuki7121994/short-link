@@ -12,7 +12,9 @@ import org.springframework.util.StringUtils;
 
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
-import java.util.concurrent.atomic.AtomicBoolean;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.http.HttpStatus;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -28,29 +30,27 @@ public class Base62EncodeCreateShortUrlHandler implements Base62EncodeService {
     public CreateShortUrlResponse handle(Object req) {
         var request = (CreateShortUrlRequest) req;
 
-        AtomicBoolean foundInDb = new AtomicBoolean(true);
         boolean isCustomAlias = StringUtils.hasText(request.getCustomAlias());
-        do {
+        if (isCustomAlias && "shorten".equalsIgnoreCase(request.getCustomAlias())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Reserved alias");
+        }
+        for (int attempt = 0; attempt < 10; attempt++) {
             String shortKey = isCustomAlias ? request.getCustomAlias() : getShortKey(7);
-            var entity = shortUrlRepository.findById(shortKey).orElse(null);
-            if (entity == null) {
-                var newEntity = ShortUrlEntity.builder()
-                        .shortUrl(shortKey)
-                        .longUrl(request.getLongUrl())
-                        .expiresAt(request.getExpiration())
-                        .createdAt(LocalDateTime.now())
-                        .updatedAt(LocalDateTime.now())
-                        .build();
+            var now = LocalDateTime.now();
+            var newEntity = ShortUrlEntity.builder()
+                    .shortUrl(shortKey).longUrl(request.getLongUrl())
+                    .expiresAt(request.getExpiration()).createdAt(now).updatedAt(now).build();
+            try {
+                // Atomic insert: never replace an existing mapping on a collision.
                 shortUrlRepository.insert(newEntity);
                 return to(newEntity);
-            } else if (isCustomAlias) {
-                return CreateShortUrlResponse.builder().existedAlias(true).build();
-            } else {
-                foundInDb.set(true);
+            } catch (DuplicateKeyException ex) {
+                if (isCustomAlias) {
+                    return CreateShortUrlResponse.builder().existedAlias(true).build();
+                }
             }
         }
-        while (foundInDb.get());
-        throw new RuntimeException("Cannot create short link");
+        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Unable to allocate short code");
     }
 
     private String getShortKey(int length) {

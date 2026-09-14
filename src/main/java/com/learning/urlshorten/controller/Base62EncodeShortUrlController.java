@@ -3,7 +3,7 @@ package com.learning.urlshorten.controller;
 import com.learning.urlshorten.dto.CreateShortUrlRequest;
 import com.learning.urlshorten.dto.CreateShortUrlResponse;
 import com.learning.urlshorten.service.base62encode.Base62EncodeService;
-import io.vavr.control.Try;
+
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import lombok.RequiredArgsConstructor;
@@ -28,15 +28,9 @@ public class Base62EncodeShortUrlController {
 
     @PostMapping("/shorten")
     public ResponseEntity<?> shorten(@Valid @RequestBody CreateShortUrlRequest req) {
-        return Try.of(() -> base62EncodeServices.get("base62_encode_create").handle(req)).toEither().fold(
-                throwable -> ResponseEntity.internalServerError().body(throwable.getMessage()),
-                (value) -> {
-                    var response = (CreateShortUrlResponse) value;
-                    return response.isExistedAlias() ?
-                            ResponseEntity.status(HttpStatus.CONFLICT).body(response) :
-                            ResponseEntity.ok().body(response);
-                }
-        );
+        var response = (CreateShortUrlResponse) base62EncodeServices.get("base62_encode_create").handle(req);
+        return ResponseEntity.status(response.isExistedAlias() ? HttpStatus.CONFLICT : HttpStatus.CREATED)
+                .body(response);
     }
 
     @GetMapping("/{shortUrl}")
@@ -47,6 +41,7 @@ public class Base62EncodeShortUrlController {
 
         return ResponseEntity.status(302)
                 .location(URI.create(longUrl))
+                .header("Cache-Control", "no-store")
                 .build();
     }
 }
