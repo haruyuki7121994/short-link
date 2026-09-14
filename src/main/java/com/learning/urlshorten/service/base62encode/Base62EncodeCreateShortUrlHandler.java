@@ -38,8 +38,12 @@ public class Base62EncodeCreateShortUrlHandler implements Base62EncodeService {
             String shortKey = isCustomAlias ? request.getCustomAlias() : getShortKey(7);
             var now = LocalDateTime.now();
             var newEntity = ShortUrlEntity.builder()
-                    .shortUrl(shortKey).longUrl(request.getLongUrl())
-                    .expiresAt(request.getExpiration()).createdAt(now).updatedAt(now).build();
+                    .shortUrl(shortKey)
+                    .longUrl(request.getLongUrl())
+                    .expiresAt(request.getExpiration())
+                    .createdAt(now)
+                    .updatedAt(now)
+                    .build();
             try {
                 // Atomic insert: never replace an existing mapping on a collision.
                 shortUrlRepository.insert(newEntity);

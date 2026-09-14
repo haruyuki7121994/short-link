@@ -25,8 +25,11 @@ public class RedisShortUrlRepository {
             if (value == null) return new CacheResult(null, null, false);
             var mapping = JSON.readValue(value, StoredMapping.class);
             if (mapping == null || mapping.longUrl() == null) return new CacheResult(null, null, false);
-            return new CacheResult(mapping.longUrl(), mapping.expiresAt() == null ? null
-                    : LocalDateTime.parse(mapping.expiresAt()), false);
+            return new CacheResult(
+                    mapping.longUrl(),
+                    mapping.expiresAt() == null ? null : LocalDateTime.parse(mapping.expiresAt()),
+                    false
+            );
         } catch (DataAccessException ex) {
             log.debug("Redis read failed: {}", ex.getClass().getSimpleName());
             return new CacheResult(null, null, true);

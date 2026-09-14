@@ -1,5 +1,6 @@
 package com.learning.urlshorten.service.base62encode;
 
+import com.learning.urlshorten.entity.ShortUrlEntity;
 import com.learning.urlshorten.exception.NotFoundException;
 import com.learning.urlshorten.repository.RedisShortUrlRepository;
 import com.learning.urlshorten.repository.ShortUrlRepository;
@@ -8,6 +9,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
+
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.concurrent.Semaphore;
@@ -19,7 +21,7 @@ public class Base62EncodeRedirectShortUrlHandler implements Base62EncodeService 
     private final Semaphore databaseLookups;
 
     public Base62EncodeRedirectShortUrlHandler(ShortUrlRepository repository, RedisShortUrlRepository cache,
-            @Value("${short-url.max-concurrent-lookups:64}") int maxLookups) {
+                                               @Value("${short-url.max-concurrent-lookups:64}") int maxLookups) {
         if (maxLookups < 1) throw new IllegalArgumentException("max-concurrent-lookups must be positive");
         this.shortUrlRepository = repository;
         this.redisShortUrlRepository = cache;
@@ -40,7 +42,7 @@ public class Base62EncodeRedirectShortUrlHandler implements Base62EncodeService 
         if (!databaseLookups.tryAcquire()) {
             throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Lookup capacity exceeded");
         }
-        com.learning.urlshorten.entity.ShortUrlEntity entity;
+        ShortUrlEntity entity;
         try {
             entity = shortUrlRepository.findById(shortCode)
                     .orElseThrow(() -> new NotFoundException("short_url not found"));
