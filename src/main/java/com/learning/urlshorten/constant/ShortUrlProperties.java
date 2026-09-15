@@ -9,4 +9,5 @@ import org.springframework.context.annotation.Configuration;
 @ConfigurationProperties(prefix = "short-url")
 public class ShortUrlProperties {
     private String domain;
+    private String domain2;
 }
