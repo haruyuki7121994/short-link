@@ -4,7 +4,7 @@ import com.learning.urlshorten.constant.ShortUrlProperties;
 import com.learning.urlshorten.dto.CreateShortUrlRequest;
 import com.learning.urlshorten.dto.CreateShortUrlResponse;
 import com.learning.urlshorten.entity.ShortUrlEntity;
-import com.learning.urlshorten.repository.RedisCounterRepository;
+import com.learning.urlshorten.repository.CounterRepository;
 import com.learning.urlshorten.repository.ShortUrlRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -23,7 +23,7 @@ public class CounterBase62EncodeCreateShortUrlHandler implements CounterBase62En
 
     private final ShortUrlRepository shortUrlRepository;
     private final ShortUrlProperties shortUrlProperties;
-    private final RedisCounterRepository redisCounterRepository;
+    private final CounterRepository counterRepository;
     private static final String ALPHANUMERIC = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
     @Override
@@ -36,8 +36,7 @@ public class CounterBase62EncodeCreateShortUrlHandler implements CounterBase62En
         }
 
         for (int attempt = 0; attempt < 10; attempt++) {
-            Long id = redisCounterRepository.increment();
-            String shortKey = isCustomAlias ? request.getCustomAlias() : getShortKey(id);
+            String shortKey = isCustomAlias ? request.getCustomAlias() : getShortKey(counterRepository.nextId());
             var now = LocalDateTime.now();
             var newEntity = ShortUrlEntity.builder()
                     .shortUrl(shortKey)
@@ -54,13 +53,14 @@ public class CounterBase62EncodeCreateShortUrlHandler implements CounterBase62En
                 if (isCustomAlias) {
                     return CreateShortUrlResponse.builder().existedAlias(true).build();
                 }
-                redisCounterRepository.incrementBy(1000);
+                // Allocate the next durable ID; never adjust or reset the counter on a collision.
             }
         }
         throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Unable to allocate short code");
     }
 
     private String getShortKey(long number) {
+        if (number <= 0) throw new IllegalArgumentException("Counter ID must be positive");
         StringBuilder sb = new StringBuilder();
         while (number > 0) {
             int index = (int) (number % ALPHANUMERIC.length());
